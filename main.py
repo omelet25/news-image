@@ -2,10 +2,15 @@
 """The World in One Day -- Monday 23 November 2026 in one image.
 
 A dense broadsheet front page drawn entirely in code with the Python
-standard library only (no PIL, no fonts, no network).  Everything is
-rendered on a 2048x2048 canvas with a hand-built stroke font and then
-box-downsampled to 1024x1024, so small type stays legible.  The output
-is deterministic: the same bytes on every run.
+standard library only (no PIL, no fonts, no network).
+
+Readability pass (v4): the page is composed in a 2048x2048 design
+space but rasterised on a 4096x4096 canvas and reduced to 1024x1024
+with a 4x4 area-average (box) filter, so stroke edges land smoothly
+instead of crumbling.  Small type gets proportionally heavier strokes
+and darker ink than in the previous edition, and the smallest sizes
+were raised a step.  The output is deterministic: the same bytes on
+every run.
 
 Writes /output/entry.png (falls back to ./entry.png when /output is
 not writable, e.g. a local dry run).
@@ -15,29 +20,33 @@ import math
 import os
 import struct
 import zlib
+from array import array
 
-W = 2048          # internal canvas size
-H = 2048
+DS = 2048         # design-space size: every layout number lives here
+W = 4096          # internal render canvas
+H = 4096
+K = W / DS        # design -> render scale factor (2.0)
 OUT = 1024        # final image size
 
 # ---------------------------------------------------------------- palette
 PAPER = (247, 243, 232)      # cream newsprint
 CARD_BG = (253, 251, 245)    # card face, a touch lighter than the sheet
 NAVY = (17, 31, 59)          # deep ink navy
-INK = (30, 33, 43)           # body text
-GRAY = (96, 102, 116)        # secondary text
+INK = (26, 29, 38)           # body text (darkened for small sizes)
+DARKTXT = (43, 46, 58)       # captions and other small print
+GRAY = (78, 83, 96)          # secondary text (darkened vs v3)
 FAINT = (203, 199, 186)      # hairlines on the sheet
 RED = (178, 33, 44)          # accent red
 TEAL = (0, 104, 94)          # REPORTED tag
 GOLD = (198, 158, 52)
 WHITE = (255, 255, 255)
 
-buf = bytearray(PAPER) * (W * H) if False else bytearray(bytes(PAPER) * (W * H))
+buf = bytearray(bytes(PAPER) * (W * H))
 
 
-# ---------------------------------------------------------------- canvas
-def fill_rect(x0, y0, x1, y1, c):
-    """Fill an axis-aligned rectangle, clipped to the canvas."""
+# ------------------------------------------------------- canvas (render)
+def _fill_r(x0, y0, x1, y1, c):
+    """Fill an axis-aligned rectangle on the render canvas, clipped."""
     x0 = max(0, int(x0)); y0 = max(0, int(y0))
     x1 = min(W, int(x1)); y1 = min(H, int(y1))
     if x1 <= x0 or y1 <= y0:
@@ -49,34 +58,26 @@ def fill_rect(x0, y0, x1, y1, c):
         buf[i:i + n] = row
 
 
-def disc(cx, cy, r, c):
-    """Filled circle (float centre/radius allowed)."""
+def _disc_r(cx, cy, r, c):
+    """Filled circle on the render canvas (float centre/radius)."""
     R = int(math.ceil(r))
     for dy in range(-R, R + 1):
         dx = math.sqrt(max(0.0, r * r - dy * dy))
-        fill_rect(cx - dx, cy + dy, cx + dx + 1, cy + dy + 1, c)
+        _fill_r(cx - dx, cy + dy, cx + dx + 1, cy + dy + 1, c)
 
 
-def line(x0, y0, x1, y1, w, c):
+def _line_r(x0, y0, x1, y1, w, c):
     """Thick line with round caps, drawn as a chain of discs."""
     r = max(0.8, w / 2.0)
     d = math.hypot(x1 - x0, y1 - y0)
-    steps = max(1, int(d / max(1.0, r * 0.7)))
+    steps = max(1, int(d / max(1.0, r * 0.9)))
     for i in range(steps + 1):
         t = i / steps
-        disc(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r, c)
+        _disc_r(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r, c)
 
 
-def polyline(pts, w, c, close=False):
-    seq = list(pts)
-    if close and len(seq) > 2:
-        seq = seq + [seq[0]]
-    for i in range(len(seq) - 1):
-        line(seq[i][0], seq[i][1], seq[i + 1][0], seq[i + 1][1], w, c)
-
-
-def fill_poly(pts, c):
-    """Scanline even-odd polygon fill."""
+def _fill_poly_r(pts, c):
+    """Scanline even-odd polygon fill on the render canvas."""
     ys = [p[1] for p in pts]
     ymin = max(0, int(min(ys)))
     ymax = min(H - 1, int(max(ys)))
@@ -91,7 +92,35 @@ def fill_poly(pts, c):
                 xs.append(x0 + (yc - y0) * (x1 - x0) / (y1 - y0))
         xs.sort()
         for i in range(0, len(xs) - 1, 2):
-            fill_rect(xs[i], y, xs[i + 1] + 1, y + 1, c)
+            _fill_r(xs[i], y, xs[i + 1] + 1, y + 1, c)
+
+
+# ------------------------------------------- canvas (design-space facade)
+# Every public primitive takes design-space coordinates (the 2048 grid
+# the layout is written in) and scales them onto the render canvas.
+
+def fill_rect(x0, y0, x1, y1, c):
+    _fill_r(x0 * K, y0 * K, x1 * K, y1 * K, c)
+
+
+def disc(cx, cy, r, c):
+    _disc_r(cx * K, cy * K, r * K, c)
+
+
+def line(x0, y0, x1, y1, w, c):
+    _line_r(x0 * K, y0 * K, x1 * K, y1 * K, w * K, c)
+
+
+def polyline(pts, w, c, close=False):
+    seq = list(pts)
+    if close and len(seq) > 2:
+        seq = seq + [seq[0]]
+    for i in range(len(seq) - 1):
+        line(seq[i][0], seq[i][1], seq[i + 1][0], seq[i + 1][1], w, c)
+
+
+def fill_poly(pts, c):
+    _fill_poly_r([(x * K, y * K) for x, y in pts], c)
 
 
 def ellipse_pts(cx, cy, rx, ry, n=44, a0=0.0, a1=360.0):
@@ -131,32 +160,47 @@ def rrect_outline(x0, y0, x1, y1, r, w, c):
 
 # ---------------------------------------------------------------- png out
 def downsample():
-    """2048x2048 -> 1024x1024 with a 2x2 box filter."""
-    out = bytearray(OUT * OUT * 3)
-    b = buf
+    """4096x4096 -> 1024x1024 with a 4x4 area-average box filter.
+
+    Two passes: first sum each group of 4 horizontal pixels (per
+    channel) into a uint16 buffer, then sum groups of 4 rows and
+    divide by 16 with rounding.
+    """
     W3 = W * 3
+    hsums = array('H')
+    for y in range(H):
+        row = buf[y * W3:(y + 1) * W3]
+        chans = []
+        for base in (0, 1, 2):
+            s = [sum(t) for t in zip(row[base::12], row[base + 3::12],
+                                     row[base + 6::12], row[base + 9::12])]
+            chans.append(s)
+        vals = [0] * (OUT * 3)
+        vals[0::3] = chans[0]
+        vals[1::3] = chans[1]
+        vals[2::3] = chans[2]
+        hsums.extend(vals)
+    out = bytearray(OUT * OUT * 3)
+    stride = OUT * 3
     for oy in range(OUT):
-        r0 = (2 * oy) * W3
-        r1 = r0 + W3
-        orow = oy * OUT * 3
-        for ox in range(OUT):
-            i0 = r0 + ox * 6
-            i1 = r1 + ox * 6
-            o = orow + ox * 3
-            out[o] = (b[i0] + b[i0 + 3] + b[i1] + b[i1 + 3]) >> 2
-            out[o + 1] = (b[i0 + 1] + b[i0 + 4] + b[i1 + 1] + b[i1 + 4]) >> 2
-            out[o + 2] = (b[i0 + 2] + b[i0 + 5] + b[i1 + 2] + b[i1 + 5]) >> 2
+        a = (4 * oy) * stride
+        rows = [hsums[a + j * stride:a + (j + 1) * stride] for j in range(4)]
+        orow = bytes((v + 8) >> 4 for v in map(sum, zip(*rows)))
+        out[oy * stride:(oy + 1) * stride] = orow
     return bytes(out)
 
 
 def write_png(path, pix, w, h):
+    # Filter type 0 (None) on every row: for this flat, palette-like
+    # page the raw rows repeat so much from line to line that zlib
+    # finds far longer matches than with any predictive filter
+    # (measured: ~218 KB vs ~302 KB for Sub).  Pure function of the
+    # pixels, so the output stays deterministic.
     raw = bytearray()
     stride = w * 3
     for y in range(h):
-        row = pix[y * stride:(y + 1) * stride]
-        raw.append(1)  # filter: Sub
-        raw += bytes((row[i] - row[i - 3]) & 255 if i >= 3 else row[i]
-                     for i in range(stride))
+        raw.append(0)  # filter: None
+        raw += pix[y * stride:(y + 1) * stride]
     comp = zlib.compress(bytes(raw), 9)
 
     def chunk(tag, data):
@@ -354,6 +398,9 @@ GLYPHS = {
                     [(34, 20), (45, 6)]]),
 }
 
+GLYPHS['\u0130'] = (30, [[(15, 0), (15, 100)], [(2, 0), (28, 0)],
+                         [(2, 100), (28, 100)], [(15, -17), (15, -11)]])
+
 
 def glyph(ch):
     return GLYPHS.get(ch, GLYPHS['?'])
@@ -369,14 +416,23 @@ def text_width(s, size, bold=False, tracking=0.0):
 
 def draw_text(x, y, s, size, color, bold=False, align='l', tracking=0.0,
               serif=False):
-    """Draw string s with its baseline at y.  Returns the drawn width."""
+    """Draw string s with its baseline at y (design space).
+
+    Returns the drawn width in design units.  Stroke weight is a
+    larger fraction of the em than in v3, and small type (under 20
+    design units) gets a further boost, because thin strokes are
+    what crumble when the page is reduced to 1024 px.
+    """
     sc = size / 100.0
     w = text_width(s, size, bold, tracking)
     if align == 'c':
         x -= w / 2.0
     elif align == 'r':
         x -= w
-    lw = size * (0.155 if bold else 0.098)
+    if bold:
+        lw = size * (0.205 if size < 20 else 0.19)
+    else:
+        lw = size * (0.155 if size < 20 else 0.13)
     cx = x
     for ch in s:
         adv, strokes = glyph(ch)
@@ -544,10 +600,10 @@ SHORTS = [
 ]
 
 STATS = [
-    ("24", "dead in the Cikande factory fire"),
-    ("258", "House seats won by the Democrats"),
-    ("$44B", "CrowdStrike's price for Zscaler"),
-    ("$1B+", "in crypto the US is suing to recover"),
+    ("24", "dead in the Cikande fire"),
+    ("258", "House seats for Democrats"),
+    ("$44B", "CrowdStrike's Zscaler deal"),
+    ("$1B+", "US suit to recover crypto"),
     ("450", "schools hit by bomb threats in Germany"),
     ("$450M", "Skubal's record contract with the Mets"),
     ("202", "career triple-doubles for Joki\u0107"),
@@ -588,9 +644,6 @@ LAND = [
     (134, -25, 13, 7), (172, -42, 3, 4),
 ]
 
-
-GLYPHS['\u0130'] = (30, [[(15, 0), (15, 100)], [(2, 0), (28, 0)],
-                         [(2, 100), (28, 100)], [(15, -17), (15, -11)]])
 
 # ---------------------------------------------------------------- panels
 # Flat illustrations, drawn inside the scene area of each card panel.
@@ -845,9 +898,9 @@ def draw_card(card, x, y, w, h, wide=False):
     fill_rect(px, py, px + pw, py + ph, card["tint"])
     ILLUS[card["illus"]](px, py, pw, ph - 22)
     fill_rect(px, py + ph - 22, px + pw, py + ph, NAVY)
-    draw_text(px + 12, py + ph - 4.5, card["banner"], 15, WHITE, bold=True)
-    draw_text(px + pw - 12, py + ph - 4.5, card["src"], 11.5,
-              (198, 204, 216), bold=True, align='r')
+    draw_text(px + 12, py + ph - 4.5, card["banner"], 15.5, WHITE, bold=True)
+    draw_text(px + pw - 12, py + ph - 4.5, card["src"], 13,
+              (216, 221, 231), bold=True, align='r')
     # number badge
     disc(x + 28, y + 28, 18, RED)
     draw_text(x + 28, y + 35.5, str(card["n"]), 21, WHITE, bold=True,
@@ -888,9 +941,9 @@ def draw_numbers(x, y, w, h):
         ry = y + (0 if i < 4 else 88)
         draw_text(cx, ry + 108, num, 46, NAVY, bold=True)
         ly = ry + 132
-        for ln in wrap_text(cap, 15, False, cw - 14)[:2]:
-            draw_text(cx, ly, ln, 15, (70, 74, 86))
-            ly += 19
+        for ln in wrap_text(cap, 16, False, cw - 14)[:2]:
+            draw_text(cx, ly, ln, 16, DARKTXT)
+            ly += 20
 
 
 def draw_header():
@@ -927,16 +980,16 @@ def draw_timeline():
     for hr in range(0, 25, 2):
         tx = x0 + hr * 60 / 1440 * span
         line(tx, ay - 6, tx, ay + 6, 2.5, NAVY)
-    draw_text(x0, 446, "00:00", 14, GRAY, bold=True)
-    draw_text(x1, 446, "24:00", 14, GRAY, bold=True, align='r')
+    draw_text(x0, 446, "00:00", 15, (52, 57, 70), bold=True)
+    draw_text(x1, 446, "24:00", 15, (52, 57, 70), bold=True, align='r')
     for t, mins, label in TIMELINE:
         ex = x0 + mins / 1440 * span
         disc(ex, ay, 8, RED)
         draw_text(ex, 444, t, 24, NAVY, bold=True, align='c')
         lx = min(max(ex, MX + 110), RIGHT - 110)
         ly = 492
-        for ln in wrap_text(label, 19, False, 210):
-            draw_text(lx, ly, ln, 19, INK, align='c')
+        for ln in wrap_text(label, 19.5, False, 210):
+            draw_text(lx, ly, ln, 19.5, INK, align='c')
             ly += 23
 
 
@@ -951,22 +1004,22 @@ def draw_shorts():
         cx = cols[c]
         by = cursors[c]
         num = str(i + 1)
-        num_w = text_width(num, 15.5, True) + 10
-        lines = wrap_text(place + " \u2014 " + text, 15.5, False,
+        num_w = text_width(num, 16.5, True) + 10
+        lines = wrap_text(place + " \u2014 " + text, 16.5, False,
                           388 - num_w)
-        draw_text(cx, by, num, 15.5, RED, bold=True)
+        draw_text(cx, by, num, 16.5, RED, bold=True)
         for k, ln in enumerate(lines):
-            draw_text(cx + (num_w if k == 0 else 0), by + k * 18.5, ln,
-                      15.5, INK)
-        draw_text(cx + num_w, by, place, 15.5, NAVY, bold=True)
-        cursors[c] = by + len(lines) * 18.5 + 7
+            draw_text(cx + (num_w if k == 0 else 0), by + k * 19.5, ln,
+                      16.5, INK)
+        draw_text(cx + num_w, by, place, 16.5, NAVY, bold=True)
+        cursors[c] = by + len(lines) * 19.5 + 6.5
 
 
 def draw_map():
     x0, y0, w, h = 1304, 1666, 700, 250
     draw_text(1304, 1628, "WHERE IT HAPPENED", 21, NAVY, bold=True)
-    draw_text(1304, 1650, "PINS MATCH THE CARD NUMBERS 1\u201313", 14.5,
-              GRAY, bold=True)
+    draw_text(1304, 1650, "PINS MATCH THE CARD NUMBERS 1\u201313", 15.5,
+              (52, 57, 70), bold=True)
 
     def proj(lon, lat):
         return (x0 + (lon + 170) / 360 * w, y0 + (80 - lat) / 138 * h)
@@ -997,9 +1050,9 @@ def draw_footer():
             "excluded \u2014 where the weekend set the stage, only Monday's "
             "development is told.")
     ly = 1986
-    for ln in wrap_text(note, 15.5, False, 1010):
-        draw_text(178, ly, ln, 15.5, INK)
-        ly += 21
+    for ln in wrap_text(note, 16.5, False, 1010):
+        draw_text(178, ly, ln, 16.5, INK)
+        ly += 22
     groups = [(NAVY, "ON RECORD", "stated by the source"),
               (TEAL, "REPORTED", "via the named outlet"),
               (RED, "CLAIM", "one side's assertion")]
@@ -1007,10 +1060,11 @@ def draw_footer():
     for color, tag, desc in groups:
         fill_rect(gx, 1975, gx + 11, 1986, color)
         gx += 17
-        gx += draw_text(gx, 1986, tag, 14, NAVY, bold=True) + 5
-        gx += draw_text(gx, 1986, desc, 14, (70, 74, 86)) + 14
+        gx += draw_text(gx, 1986, tag, 15, NAVY, bold=True) + 5
+        gx += draw_text(gx, 1986, desc, 15, DARKTXT) + 14
     draw_text(RIGHT, 2014, "All pictures and the map are drawn in code "
-                           "\u2014 no photographs.", 14, GRAY, align='r')
+                           "\u2014 no photographs.", 15, (70, 74, 86),
+              align='r')
 
 
 def build():
